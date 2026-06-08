@@ -1,378 +1,580 @@
-# ORCH Agent — Orchestrator
+# ORCH Agent — LangGraph Orchestrator with GPT-4o-mini
 #
-# This is the brain of the entire system.
-# It owns the state machine, routes every task to the correct agent,
-# and drives the full investment lifecycle from stock selection to closure.
+# This is NOT a script calling functions in order.
+# It's a LangGraph StateGraph where:
+#   - Each existing agent is wrapped as a graph NODE
+#   - An LLM sits at the decision point and REASONS about what to do
+#   - State flows through the graph, each node reads/writes specific fields
+#   - The LLM can OVERRIDE the rules engine if the alert is noise
 #
-# It does NOT implement any business logic itself — it only coordinates.
-# Every calculation, analysis, notification, and log call is delegated
-# to the appropriate specialist agent.
-#
-# The three phases:
-#   Phase 1 — PRE_INVESTMENT : Stock selection → budget → confirmation
-#   Phase 2 — MONITORING     : Hourly polls, alerts, client decisions
-#   Phase 3 — CLOSED         : Investment sold or expired
-#
-# Interview explanation:
-#   "The Orchestrator is the only agent that knows about all other agents.
-#   Every other agent is isolated — DATA doesn't know about ALERT,
-#   PROFIT doesn't know about NOTIF. Only ORCH holds the full picture.
-#   This is the Mediator pattern — it centralises communication so
-#   agents stay decoupled from each other."
+# Graph:
+#   fetch_price → calc_profit → eval_alert → llm_decision → notify → log
+#                                  ↓ (no alert)
+#                                log → END
 
+import os
+import json
 import uuid
-from datetime import datetime
+import logging
+from typing import TypedDict, Optional
+from datetime import date, timedelta
 
-from agents.data_fetcher      import get_stock_quote, get_historical_data
-from agents.stock_ranker      import rank_stocks
+from langgraph.graph import StateGraph, END
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from agents.data_fetcher       import get_stock_quote, get_historical_data
+from agents.stock_ranker       import rank_stocks
 from agents.investment_manager import create_investment, get_days_remaining
 from agents.profit_calculator  import calculate_profit
 from agents.alert_decision     import evaluate_alerts
 from agents.situation_analyser import analyse_situation
 from agents.notification       import send_notification, preview_notification
-from agents.decision_logger    import log_event, init_db, get_last_client_decision
+from agents.decision_logger    import log_event, init_db
 
-from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
 
-DEFAULT_DB_PATH = str(Path(__file__).parent.parent / "data" / "stock_agent.db")
+logger = logging.getLogger("orchestrator")
 
+
+# ─────────────────────────────────────────────────────────────────
+#  LLM SETUP
+# ─────────────────────────────────────────────────────────────────
+
+llm = ChatGoogleGenerativeAI(
+    model             = "gemini-2.5-flash",
+    temperature       = 0.3,
+    google_api_key    = os.getenv("GOOGLE_API_KEY", "")
+)
+
+SYSTEM_PROMPT = """You are an AI investment advisor agent managing a client's stock portfolio.
+Your goal: help the client achieve 5% profit on a single stock within 30 days.
+
+When a rules-based alert is triggered, YOU decide:
+1. Is this alert worth sending to the client right now, or is it noise?
+2. What recommendation should you give (natural language, 1-2 sentences)?
+3. How confident are you? (HIGH/MEDIUM/LOW)
+
+Consider momentum, trend, time remaining, and whether the move is meaningful.
+Be concise, honest, and actionable. If signals are mixed, say so.
+
+Respond ONLY in this JSON format:
+{"send_alert": true/false, "recommendation": "your advice", "confidence": "HIGH/MEDIUM/LOW", "reasoning": "brief explanation"}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────
+#  STATE — flows through the graph, each node reads/writes fields
+# ─────────────────────────────────────────────────────────────────
+
+class AgentState(TypedDict):
+    # Identity
+    ticker: str
+    investment_id: str
+
+    # Investment record (locked at investment time)
+    purchase_price: float
+    shares: int
+    total_invested: float
+    investment_date: str
+    deadline_date: str
+    budget: float
+
+    # Live data (updated each poll)
+    ohlcv_data: Optional[list]
+    current_price: Optional[float]
+    profit_pct: Optional[float]
+    profit_dollars: Optional[float]
+    change_since_last_poll: Optional[float]
+
+    # Alert state (persists between polls)
+    loss_alert_armed: bool
+    upside_alert_armed: bool
+    last_alerted_profit_pct: float
+    last_poll_profit_pct: float
+    days_remaining: int
+
+    # Convenience flags from PROFIT agent
+    is_in_loss: Optional[bool]
+    loss_exceeds_1_pct: Optional[bool]
+    reached_3_pct: Optional[bool]
+    reached_5_pct: Optional[bool]
+
+    # Decision flow (filled during graph execution)
+    alert_action: Optional[str]
+    should_alert: Optional[bool]
+    recommendation: Optional[str]
+    confidence: Optional[str]
+    llm_reasoning: Optional[str]
+    alert_sent: Optional[bool]
+    logged: Optional[bool]
+
+    # Client response
+    decision: Optional[str]
+
+    # System config
+    phase: str
+    db_path: str
+    dry_run: bool
+
+
+# ─────────────────────────────────────────────────────────────────
+#  NODE 1: DATA AGENT — fetch current price
+# ─────────────────────────────────────────────────────────────────
+
+def fetch_price_node(state: AgentState) -> dict:
+    """Wraps the DATA agent as a graph node."""
+    quote = get_stock_quote(state["ticker"])
+
+    if not quote["success"]:
+        log_event(state["investment_id"], "API_ERROR",
+                  {"error": quote["error"]}, db_path=state["db_path"])
+        return {"current_price": None, "alert_action": "API_ERROR"}
+
+    return {"current_price": quote["price"]}
+
+
+# ─────────────────────────────────────────────────────────────────
+#  NODE 2: PROFIT AGENT — calculate P&L
+# ─────────────────────────────────────────────────────────────────
+
+def calc_profit_node(state: AgentState) -> dict:
+    """Wraps the PROFIT agent as a graph node."""
+    if not state.get("current_price"):
+        return {}
+
+    result = calculate_profit(
+        current_price       = state["current_price"],
+        purchase_price      = state["purchase_price"],
+        shares              = state["shares"],
+        total_invested      = state["total_invested"],
+        previous_profit_pct = state["last_poll_profit_pct"]
+    )
+
+    if not result["success"]:
+        return {}
+
+    days = get_days_remaining(state["investment_date"])
+
+    return {
+        "profit_pct":           result["profit_loss_pct"],
+        "profit_dollars":       result["profit_loss_dollars"],
+        "change_since_last_poll": result["change_since_last_poll"],
+        "days_remaining":       days,
+        "is_in_loss":           result["is_in_loss"],
+        "loss_exceeds_1_pct":   result["loss_exceeds_1_pct"],
+        "reached_3_pct":        result["reached_3_pct"],
+        "reached_5_pct":        result["reached_5_pct"],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+#  NODE 3: ALERT AGENT — evaluate rules
+# ─────────────────────────────────────────────────────────────────
+
+def eval_alert_node(state: AgentState) -> dict:
+    """Wraps the ALERT agent as a graph node."""
+    if state.get("profit_pct") is None:
+        return {"alert_action": "NO_ACTION"}
+
+    alert = evaluate_alerts(
+        profit_loss_pct          = state["profit_pct"],
+        change_since_last_poll   = state["change_since_last_poll"],
+        last_alerted_profit_pct  = state["last_alerted_profit_pct"],
+        loss_alert_armed         = state["loss_alert_armed"],
+        upside_alert_armed       = state["upside_alert_armed"],
+        days_remaining           = state["days_remaining"],
+        is_in_loss               = state["is_in_loss"],
+        loss_exceeds_1_pct       = state["loss_exceeds_1_pct"],
+        reached_3_pct            = state["reached_3_pct"],
+        reached_5_pct            = state["reached_5_pct"]
+    )
+
+    updated = alert["updated_alert_state"]
+    return {
+        "alert_action":          alert["action"],
+        "loss_alert_armed":      updated["loss_alert_armed"],
+        "upside_alert_armed":    updated["upside_alert_armed"],
+        "last_alerted_profit_pct": updated["last_alerted_profit_pct"],
+        "last_poll_profit_pct":  state["profit_pct"],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+#  NODE 4: LLM DECISION — the intelligent part
+# ─────────────────────────────────────────────────────────────────
+
+def llm_decision_node(state: AgentState) -> dict:
+    """
+    GPT-4o-mini reasons about whether to send the alert.
+    Can override the rules engine if the alert is noise.
+    Generates natural language recommendation.
+    """
+    action = state.get("alert_action", "NO_ACTION")
+
+    context = f"""
+Stock: {state['ticker']}
+Purchase: ${state['purchase_price']:.2f} | Current: ${state['current_price']:.2f}
+P&L: {state['profit_pct']:+.2f}% (${state['profit_dollars']:+.2f})
+Change since last check: {state['change_since_last_poll']:+.2f}%
+Days remaining: {state['days_remaining']}/30
+Alert triggered by rules engine: {action}
+
+Should this alert be sent to the client right now?
+"""
+
+    try:
+        response = llm.invoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=context)
+        ])
+
+        text = response.content.strip()
+        # Strip markdown code fences if present
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+        output = json.loads(text)
+
+        send = output.get("send_alert", True)
+        return {
+            "should_alert":   send,
+            "recommendation": output.get("recommendation", ""),
+            "confidence":     output.get("confidence", "MEDIUM"),
+            "llm_reasoning":  output.get("reasoning", ""),
+            # Override alert_action if LLM says don't send
+            "alert_action":   state["alert_action"] if send else "NO_ACTION"
+        }
+
+    except Exception as e:
+        logger.warning(f"LLM failed ({e}), falling back to deterministic.")
+        # Fallback: honour the rules engine as-is
+        return {
+            "should_alert":   True,
+            "recommendation": f"Alert triggered: {action}. Check your investment.",
+            "confidence":     "MEDIUM",
+            "llm_reasoning":  f"LLM unavailable ({e}), using rules engine."
+        }
+
+
+# ─────────────────────────────────────────────────────────────────
+#  NODE 5: NOTIFICATION AGENT — send the alert
+# ─────────────────────────────────────────────────────────────────
+
+def notify_node(state: AgentState) -> dict:
+    """Wraps the NOTIF agent as a graph node."""
+    action = state.get("alert_action", "NO_ACTION")
+    if action == "NO_ACTION" or action == "API_ERROR":
+        return {"alert_sent": False}
+
+    notif_map = {
+        "LOSS_ALERT_MINOR": "LOSS_MINOR",
+        "LOSS_ALERT_MAJOR": "LOSS_MAJOR",
+        "UPSIDE_ALERT":     "UPSIDE_ALERT",
+        "TARGET_REACHED":   "TARGET_REACHED",
+        "DEADLINE_REACHED": "DEADLINE"
+    }
+    notif_type = notif_map.get(action)
+    if not notif_type:
+        return {"alert_sent": False}
+
+    # Build investment dict for the NOTIF agent
+    investment = {
+        "ticker":         state["ticker"],
+        "purchase_price": state["purchase_price"],
+        "shares":         state["shares"],
+        "total_invested": state["total_invested"],
+        "investment_date":state["investment_date"],
+        "deadline_date":  state["deadline_date"],
+        "status":         "ACTIVE"
+    }
+
+    # Build profit dict
+    profit_data = {
+        "current_price":       state["current_price"],
+        "current_value":       state["shares"] * state["current_price"],
+        "total_invested":      state["total_invested"],
+        "profit_loss_pct":     state["profit_pct"],
+        "profit_loss_dollars": state["profit_dollars"],
+        "change_since_last_poll": state["change_since_last_poll"],
+        "is_in_profit":        state["profit_pct"] > 0,
+        "is_in_loss":          state["profit_pct"] < 0,
+    }
+
+    # Build recommendation from LLM output
+    recommendation = {
+        "success":        True,
+        "recommendation": state.get("recommendation", ""),
+        "confidence":     state.get("confidence", "MEDIUM"),
+        "reason":         state.get("llm_reasoning", ""),
+        "signals": {
+            "sma_signal":      "LLM-based",
+            "momentum_3d_pct": state["change_since_last_poll"],
+            "volume_pressure": "LLM-based",
+            "days_remaining":  state["days_remaining"],
+            "profit_pct":      state["profit_pct"]
+        }
+    }
+
+    send_fn = preview_notification if state["dry_run"] else send_notification
+    result = send_fn(
+        notification_type = notif_type,
+        investment        = investment,
+        profit_data       = profit_data,
+        recommendation    = recommendation,
+        days_remaining    = state["days_remaining"]
+    )
+
+    return {"alert_sent": result.get("success", False)}
+
+
+# ─────────────────────────────────────────────────────────────────
+#  NODE 6: LOGGER AGENT — record everything
+# ─────────────────────────────────────────────────────────────────
+
+def log_poll_node(state: AgentState) -> dict:
+    """Wraps the LOG agent as a graph node."""
+    log_event(
+        investment_id = state["investment_id"],
+        event_type    = "POLL_COMPLETED",
+        data = {
+            "current_price":  state.get("current_price"),
+            "profit_pct":     state.get("profit_pct"),
+            "alert_action":   state.get("alert_action"),
+            "should_alert":   state.get("should_alert"),
+            "llm_reasoning":  (state.get("llm_reasoning") or "")[:100],
+            "alert_sent":     state.get("alert_sent")
+        },
+        db_path = state["db_path"]
+    )
+    return {"logged": True}
+
+
+# ─────────────────────────────────────────────────────────────────
+#  ROUTING — conditional edges in the graph
+# ─────────────────────────────────────────────────────────────────
+
+def route_after_alert_eval(state: AgentState) -> str:
+    """After rules engine: go to LLM if alert triggered, else skip to log."""
+    action = state.get("alert_action", "NO_ACTION")
+    if action in ("NO_ACTION", "API_ERROR"):
+        return "log_poll"
+    return "llm_decision"
+
+
+def route_after_llm(state: AgentState) -> str:
+    """After LLM: send notification if should_alert=True, else skip to log."""
+    if state.get("should_alert"):
+        return "notify"
+    return "log_poll"
+
+
+# ─────────────────────────────────────────────────────────────────
+#  BUILD THE GRAPH
+# ─────────────────────────────────────────────────────────────────
+
+def build_monitoring_graph():
+    """
+    Constructs the LangGraph state machine:
+
+        fetch_price → calc_profit → eval_alert
+                                        │
+                         ┌──────────────┼──────────────┐
+                         ↓ (NO_ACTION)  ↓ (alert)      │
+                      log_poll      llm_decision       │
+                         ↑              │               │
+                         │    ┌─────────┼─────────┐    │
+                         │    ↓ (skip)  ↓ (send)  │    │
+                         │  log_poll   notify     │    │
+                         │              ↓          │    │
+                         │           log_poll      │    │
+                         └────────── END ──────────┘────┘
+    """
+    graph = StateGraph(AgentState)
+
+    # Register nodes
+    graph.add_node("fetch_price",   fetch_price_node)
+    graph.add_node("calc_profit",   calc_profit_node)
+    graph.add_node("eval_alert",    eval_alert_node)
+    graph.add_node("llm_decision",  llm_decision_node)
+    graph.add_node("notify",        notify_node)
+    graph.add_node("log_poll",      log_poll_node)
+
+    # Linear edges
+    graph.set_entry_point("fetch_price")
+    graph.add_edge("fetch_price", "calc_profit")
+    graph.add_edge("calc_profit", "eval_alert")
+
+    # Conditional: after alert evaluation
+    graph.add_conditional_edges(
+        "eval_alert",
+        route_after_alert_eval,
+        {"llm_decision": "llm_decision", "log_poll": "log_poll"}
+    )
+
+    # Conditional: after LLM decides
+    graph.add_conditional_edges(
+        "llm_decision",
+        route_after_llm,
+        {"notify": "notify", "log_poll": "log_poll"}
+    )
+
+    # After notify, always log
+    graph.add_edge("notify", "log_poll")
+
+    # Log is the final node
+    graph.add_edge("log_poll", END)
+
+    return graph.compile()
+
+
+# ─────────────────────────────────────────────────────────────────
+#  ORCHESTRATOR CLASS — wraps graph for the Flask API
+# ─────────────────────────────────────────────────────────────────
 
 class StockAgentOrchestrator:
     """
-    The central controller for the Stock Agent system.
+    AI-powered orchestrator using LangGraph + GPT-4o-mini.
 
-    Holds the global state machine:
-        phase          : PRE_INVESTMENT | MONITORING | CLOSED
-        investment     : The active investment record
-        alert_state    : Current armed/disarmed state of all alert thresholds
-        price_cache    : Last fetched OHLCV history (avoids redundant API calls)
-
-    All public methods return a dict with:
-        {"success": True/False, ...result fields...}
+    The LLM:
+    - Can override alert rules if it decides the signal is noise
+    - Generates natural language recommendations
+    - Provides auditable reasoning for every decision
     """
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH,
-                 dry_run: bool = False):
-        """
-        Parameters:
-            db_path  : Path to SQLite database
-            dry_run  : If True, previews emails instead of sending them.
-                       Set to True for development/testing.
-        """
-        self.db_path = db_path
-        self.dry_run = dry_run
-
-        # ── System state ──────────────────────────────────────────
-        self.phase      = "PRE_INVESTMENT"
-        self.investment = None      # set by confirm_investment()
-        self.price_cache = []       # last fetched daily_data
-
-        # Alert thresholds — managed by ALERT agent output
+    def __init__(self, db_path="data/stock_agent.db", dry_run=False):
+        self.db_path   = db_path
+        self.dry_run   = dry_run
+        self.phase     = "PRE_INVESTMENT"
+        self.investment = None
+        self.price_cache = []
         self.alert_state = {
-            "loss_alert_armed":        True,
-            "upside_alert_armed":      True,
-            "last_alerted_profit_pct": 0.0,
+            "loss_alert_armed": True,
+            "upside_alert_armed": True,
+            "last_alerted_profit_pct": 0.0
         }
-
         self.last_poll_profit_pct = 0.0
-
-        # Initialise the database
+        self.graph = build_monitoring_graph()
         init_db(db_path)
 
-    # ─────────────────────────────────────────────────────────────
-    #  PHASE 1: PRE-INVESTMENT
-    # ─────────────────────────────────────────────────────────────
-
-    def get_top5_stocks(self, candidates: list = None) -> dict:
-        """
-        Fetches historical data for candidate stocks and returns
-        the top 5 ranked by suitability for a 5%/30-day target.
-
-        Parameters:
-            candidates : List of ticker strings. If None, uses a default
-                         set of well-known stocks.
-
-        Returns top 5 ranked stocks with scores and rationale.
-        """
-        if candidates is None:
-            candidates = [
-                "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-                "NVDA", "TSLA", "AMD",   "ORCL", "ADBE"
-            ]
-
-        print(f"\n  Loading historical data for {len(candidates)} stocks...")
-        candidate_data = []
-
-        for ticker in candidates:
-            history = get_historical_data(ticker, days=90)
-            if history["success"]:
-                candidate_data.append({
-                    "ticker":        ticker,
-                    "current_price": history["daily_data"][-1]["close"],
-                    "daily_data":    history["daily_data"]
-                })
-            else:
-                print(f"  ⚠️  {ticker}: {history['error']}")
-
-        if not candidate_data:
-            return {
-                "success": False,
-                "error": "No stock data could be fetched."
-            }
-
-        result = rank_stocks(candidate_data)
-
-        if result["success"]:
-            # Cache historical data for the top pick (used later by SIT agent)
-            top_ticker = result["top5"][0]["ticker"]
-            for c in candidate_data:
-                if c["ticker"] == top_ticker:
-                    self.price_cache = c["daily_data"]
-                    break
-
-        return result
-
     def confirm_investment(self, ticker: str, budget: float) -> dict:
-        """
-        Validates the investment, creates the investment record, and
-        transitions the system to MONITORING phase.
-
-        Called after the client reviews the Top 5 and selects a stock.
-
-        Parameters:
-            ticker : Stock symbol the client chose
-            budget : Dollar amount the client wants to invest
-        """
+        """Validates and creates the investment record."""
         if self.phase == "MONITORING":
-            return {
-                "success": False,
-                "error": "An active investment already exists. "
-                         "Close it before starting a new one."
-            }
+            return {"success": False,
+                    "error": "An active investment already exists."}
 
-        # Get current price for the selected stock
         quote = get_stock_quote(ticker)
         if not quote["success"]:
-            return {
-                "success": False,
-                "error": f"Could not fetch current price for {ticker}: "
-                         f"{quote['error']}"
-            }
+            return {"success": False, "error": quote["error"]}
 
-        # Create the investment record
-        inv_result = create_investment(
-            ticker=ticker,
-            budget=budget,
-            current_price=quote["price"]
-        )
+        inv = create_investment(ticker=ticker, budget=budget,
+                               current_price=quote["price"])
+        if not inv["success"]:
+            return inv
 
-        if not inv_result["success"]:
-            return inv_result
-
-        # Generate a unique investment ID
-        inv_result["investment_id"] = f"inv_{str(uuid.uuid4())[:8].upper()}"
-
-        # Store in orchestrator state
-        self.investment        = inv_result
-        self.phase             = "MONITORING"
+        inv["investment_id"] = f"inv_{str(uuid.uuid4())[:8].upper()}"
+        self.investment = inv
+        self.phase = "MONITORING"
         self.last_poll_profit_pct = 0.0
         self.alert_state = {
-            "loss_alert_armed":        True,
-            "upside_alert_armed":      True,
+            "loss_alert_armed": True,
+            "upside_alert_armed": True,
             "last_alerted_profit_pct": 0.0
         }
 
-        # Fetch and cache the price history for this stock
         history = get_historical_data(ticker, days=90)
         if history["success"]:
             self.price_cache = history["daily_data"]
 
-        # Log the investment creation
-        self._log("INVESTMENT_CREATED", {
-            "ticker":        inv_result["ticker"],
-            "purchase_price":inv_result["purchase_price"],
-            "shares":        inv_result["shares"],
-            "total_invested":inv_result["total_invested"],
-            "budget":        budget
-        })
+        log_event(inv["investment_id"], "INVESTMENT_CREATED", {
+            "ticker": ticker, "shares": inv["shares"],
+            "purchase_price": inv["purchase_price"]
+        }, db_path=self.db_path)
 
-        print(inv_result["confirmation_summary"])
-        return {
-            "success": True,
-            "investment_id": inv_result["investment_id"],
-            "investment":    inv_result
-        }
-
-    # ─────────────────────────────────────────────────────────────
-    #  PHASE 2: MONITORING
-    # ─────────────────────────────────────────────────────────────
+        return {"success": True, "investment_id": inv["investment_id"],
+                "investment": inv}
 
     def run_hourly_poll(self) -> dict:
         """
-        Runs one complete hourly monitoring cycle:
-            1. Fetch current price (DATA agent)
-            2. Calculate profit/loss (PROFIT agent)
-            3. Evaluate alert conditions (ALERT agent)
-            4. If alert needed: run SIT analysis if required
-            5. Send notification (NOTIF agent)
-            6. Log everything (LOG agent)
-
-        Called by the Scheduler every 60 minutes during market hours.
-        Also callable manually for testing.
-
-        Returns the action taken and current profit state.
+        Executes one monitoring cycle through the LangGraph state machine.
+        The LLM decides at the decision node whether to alert or suppress.
         """
         if self.phase != "MONITORING":
-            return {
-                "success": False,
-                "error": f"System is in '{self.phase}' phase. "
-                         "No active investment to monitor."
-            }
+            return {"success": False, "error": f"Phase: {self.phase}"}
 
-        ticker = self.investment["ticker"]
-
-        # Step 1 — Fetch current price
-        quote = get_stock_quote(ticker)
-        if not quote["success"]:
-            self._log("API_ERROR", {"error": quote["error"], "ticker": ticker})
-            return {
-                "success": False,
-                "error": f"Price fetch failed: {quote['error']}"
-            }
-
-        current_price = quote["price"]
-
-        # Step 2 — Calculate profit/loss
-        profit = calculate_profit(
-            current_price       = current_price,
-            purchase_price      = self.investment["purchase_price"],
-            shares              = self.investment["shares"],
-            total_invested      = self.investment["total_invested"],
-            previous_profit_pct = self.last_poll_profit_pct
-        )
-
-        if not profit["success"]:
-            return {"success": False, "error": profit["error"]}
-
-        # Step 3 — Evaluate alert conditions
-        days_remaining = get_days_remaining(
-            self.investment["investment_date"]
-        )
-
-        alert = evaluate_alerts(
-            profit_loss_pct          = profit["profit_loss_pct"],
-            change_since_last_poll   = profit["change_since_last_poll"],
-            last_alerted_profit_pct  = self.alert_state["last_alerted_profit_pct"],
-            loss_alert_armed         = self.alert_state["loss_alert_armed"],
-            upside_alert_armed       = self.alert_state["upside_alert_armed"],
-            days_remaining           = days_remaining,
-            is_in_loss               = profit["is_in_loss"],
-            loss_exceeds_1_pct       = profit["loss_exceeds_1_pct"],
-            reached_3_pct            = profit["reached_3_pct"],
-            reached_5_pct            = profit["reached_5_pct"]
-        )
-
-        # Update alert state from ALERT agent output
-        self.alert_state.update(alert["updated_alert_state"])
-        self.last_poll_profit_pct = profit["profit_loss_pct"]
-
-        # Log the poll
-        self._log("POLL_COMPLETED", {
-            "current_price":   current_price,
-            "profit_pct":      profit["profit_loss_pct"],
-            "profit_dollars":  profit["profit_loss_dollars"],
-            "days_remaining":  days_remaining,
-            "action":          alert["action"]
-        })
-
-        # Step 4 — Handle the alert action
-        action = alert["action"]
-
-        if action == "NO_ACTION":
-            return {
-                "success":       True,
-                "action":        "NO_ACTION",
-                "profit_pct":    profit["profit_loss_pct"],
-                "profit_dollars":profit["profit_loss_dollars"],
-                "current_price": current_price,
-                "days_remaining":days_remaining
-            }
-
-        # Get SIT analysis if needed
-        recommendation = None
-        if alert["situation_analysis_required"] and self.price_cache:
-            # Update price cache with today's price
-            updated_cache = self.price_cache.copy()
-            if updated_cache and updated_cache[-1]["close"] != current_price:
-                from datetime import date
-                updated_cache.append({
-                    "date":   date.today().isoformat(),
-                    "open":   current_price,
-                    "high":   current_price,
-                    "low":    current_price,
-                    "close":  current_price,
-                    "volume": 0
-                })
-
-            mode_map = {
-                "LOSS_ALERT_MAJOR": "LOSS",
-                "TARGET_REACHED":   "TARGET_REACHED",
-                "DEADLINE_REACHED": "END_OF_PERIOD"
-            }
-            sit_mode = mode_map.get(action)
-            if sit_mode:
-                recommendation = analyse_situation(
-                    mode           = sit_mode,
-                    daily_data     = updated_cache,
-                    profit_pct     = profit["profit_loss_pct"],
-                    days_remaining = days_remaining
-                )
-
-        # Step 5 — Map action to notification type
-        notif_map = {
-            "LOSS_ALERT_MINOR": "LOSS_MINOR",
-            "LOSS_ALERT_MAJOR": "LOSS_MAJOR",
-            "UPSIDE_ALERT":     "UPSIDE_ALERT",
-            "TARGET_REACHED":   "TARGET_REACHED",
-            "DEADLINE_REACHED": "DEADLINE"
+        # Build initial state for graph execution
+        initial_state: AgentState = {
+            "ticker":               self.investment["ticker"],
+            "investment_id":        self.investment["investment_id"],
+            "purchase_price":       self.investment["purchase_price"],
+            "shares":               self.investment["shares"],
+            "total_invested":       self.investment["total_invested"],
+            "investment_date":      self.investment["investment_date"],
+            "deadline_date":        self.investment["deadline_date"],
+            "budget":               self.investment["budget"],
+            "ohlcv_data":           self.price_cache,
+            "current_price":        None,
+            "profit_pct":           None,
+            "profit_dollars":       None,
+            "change_since_last_poll": None,
+            "loss_alert_armed":     self.alert_state["loss_alert_armed"],
+            "upside_alert_armed":   self.alert_state["upside_alert_armed"],
+            "last_alerted_profit_pct": self.alert_state["last_alerted_profit_pct"],
+            "last_poll_profit_pct": self.last_poll_profit_pct,
+            "days_remaining":       0,
+            "is_in_loss":           None,
+            "loss_exceeds_1_pct":   None,
+            "reached_3_pct":        None,
+            "reached_5_pct":        None,
+            "alert_action":         None,
+            "should_alert":         None,
+            "recommendation":       None,
+            "confidence":           None,
+            "llm_reasoning":        None,
+            "alert_sent":           None,
+            "logged":               None,
+            "decision":             None,
+            "phase":                self.phase,
+            "db_path":              self.db_path,
+            "dry_run":              self.dry_run,
         }
-        notif_type = notif_map.get(action)
 
-        notif_result = None
-        if notif_type:
-            notif_result = self._send(
-                notif_type, profit, recommendation, days_remaining
-            )
-            self._log("ALERT_FIRED", {
-                "action":     action,
-                "notif_type": notif_type,
-                "profit_pct": profit["profit_loss_pct"],
-                "alert_id":   notif_result.get("alert_id", "N/A")
-            })
+        # Execute the graph
+        final_state = self.graph.invoke(initial_state)
+
+        # Sync state back to orchestrator (persists between polls)
+        self.alert_state = {
+            "loss_alert_armed":      final_state["loss_alert_armed"],
+            "upside_alert_armed":    final_state["upside_alert_armed"],
+            "last_alerted_profit_pct": final_state["last_alerted_profit_pct"],
+        }
+        self.last_poll_profit_pct = final_state.get("last_poll_profit_pct",
+                                                     self.last_poll_profit_pct)
 
         return {
             "success":        True,
-            "action":         action,
-            "profit_pct":     profit["profit_loss_pct"],
-            "profit_dollars": profit["profit_loss_dollars"],
-            "current_price":  current_price,
-            "days_remaining": days_remaining,
-            "recommendation": recommendation,
-            "notification":   notif_result
+            "action":         final_state.get("alert_action") or "NO_ACTION",
+            "profit_pct":     final_state.get("profit_pct") or 0.0,
+            "profit_dollars": final_state.get("profit_dollars") or 0.0,
+            "current_price":  final_state.get("current_price") or 0.0,
+            "days_remaining": final_state.get("days_remaining") or 0,
+            "should_alert":   final_state.get("should_alert"),
+            "llm_reasoning":  final_state.get("llm_reasoning") or "",
+            "recommendation": final_state.get("recommendation"),
+            "confidence":     final_state.get("confidence"),
+            "alert_sent":     final_state.get("alert_sent", False)
         }
 
     def send_daily_summary(self) -> dict:
-        """
-        Sends the daily P&L summary email to the client.
-        Called by the Scheduler once per day at market close.
-        """
+        """Sends daily P&L summary email."""
         if self.phase != "MONITORING":
-            return {"success": False,
-                    "error": "No active investment to summarise."}
+            return {"success": False, "error": "No active investment."}
 
-        ticker = self.investment["ticker"]
-        quote  = get_stock_quote(ticker)
-
+        quote = get_stock_quote(self.investment["ticker"])
         if not quote["success"]:
             return {"success": False, "error": quote["error"]}
 
@@ -383,196 +585,77 @@ class StockAgentOrchestrator:
             total_invested      = self.investment["total_invested"],
             previous_profit_pct = self.last_poll_profit_pct
         )
-
-        days_remaining = get_days_remaining(self.investment["investment_date"])
-        result = self._send("DAILY_SUMMARY", profit, None, days_remaining)
-        self._log("DAILY_SUMMARY_SENT", {
-            "profit_pct":  profit["profit_loss_pct"],
-            "days_remaining": days_remaining
-        })
-        return result
-
-    def send_daily_summary(self) -> dict:
-        """
-        Sends the daily P&L summary email to the client.
-        Called by the Scheduler once per day at market close.
-        """
-        if self.phase != "MONITORING":
-            return {"success": False,
-                    "error": "No active investment to summarise."}
-
-        ticker = self.investment["ticker"]
-        quote  = get_stock_quote(ticker)
-
-        if not quote["success"]:
-            return {"success": False, "error": quote["error"]}
-
-        profit = calculate_profit(
-            current_price       = quote["price"],
-            purchase_price      = self.investment["purchase_price"],
-            shares              = self.investment["shares"],
-            total_invested      = self.investment["total_invested"],
-            previous_profit_pct = self.last_poll_profit_pct
-        )
-
-        days_remaining = get_days_remaining(self.investment["investment_date"])
-        result = self._send("DAILY_SUMMARY", profit, None, days_remaining)
-        self._log("DAILY_SUMMARY_SENT", {
-            "profit_pct":     profit["profit_loss_pct"],
-            "days_remaining": days_remaining
-        })
+        days = get_days_remaining(self.investment["investment_date"])
+        send_fn = preview_notification if self.dry_run else send_notification
+        result = send_fn("DAILY_SUMMARY", self.investment, profit,
+                         days_remaining=days)
+        log_event(self.investment["investment_id"], "DAILY_SUMMARY_SENT",
+                  {"profit_pct": profit["profit_loss_pct"]},
+                  db_path=self.db_path)
         return result
 
     def record_client_decision(self, decision: str) -> dict:
-        """
-        Records the client's response to an alert (CONTINUE, SELL, EXTEND).
-
-        Parameters:
-            decision : "CONTINUE" | "SELL" | "EXTEND"
-
-        If SELL: closes the investment and transitions to CLOSED phase.
-        If CONTINUE: resets alert thresholds and resumes monitoring.
-        If EXTEND: opens a new 30-day window from today.
-        """
+        """Records client response: CONTINUE, SELL, or EXTEND."""
         if self.phase != "MONITORING":
-            return {"success": False,
-                    "error": "No active investment to decide on."}
+            return {"success": False, "error": "No active investment."}
 
         decision = decision.upper().strip()
         valid = {"CONTINUE", "SELL", "EXTEND"}
         if decision not in valid:
-            return {
-                "success": False,
-                "error": f"Decision must be one of {valid}. Got: '{decision}'"
-            }
+            return {"success": False,
+                    "error": f"Decision must be one of {valid}."}
 
-        self._log("CLIENT_DECISION", {
-            "decision":   decision,
-            "profit_pct": self.last_poll_profit_pct
-        })
+        log_event(self.investment["investment_id"], "CLIENT_DECISION",
+                  {"decision": decision}, db_path=self.db_path)
 
         if decision == "SELL":
             self.investment["status"] = "SOLD"
             self.phase = "CLOSED"
-            self._log("MONITORING_CLOSED", {
-                "reason": "CLIENT_SOLD",
-                "profit_pct": self.last_poll_profit_pct
-            })
+            log_event(self.investment["investment_id"], "MONITORING_CLOSED",
+                      {"reason": "CLIENT_SOLD"}, db_path=self.db_path)
             return {
-                "success":    True,
-                "decision":   "SELL",
-                "message":    (
-                    f"Please log into your brokerage and sell "
-                    f"{self.investment['shares']} shares of "
-                    f"{self.investment['ticker']}. "
-                    f"Monitoring has stopped."
-                ),
+                "success": True, "decision": "SELL",
+                "message": f"Sell {self.investment['shares']} shares of "
+                           f"{self.investment['ticker']}. Monitoring stopped.",
                 "profit_pct": self.last_poll_profit_pct
             }
-
         elif decision == "CONTINUE":
-            # Reset alert thresholds so the next crossings fire fresh
             self.alert_state = {
-                "loss_alert_armed":        not self.investment.get("is_in_loss", False),
-                "upside_alert_armed":      self.last_poll_profit_pct < 3.0,
+                "loss_alert_armed": True,
+                "upside_alert_armed": self.last_poll_profit_pct < 3.0,
                 "last_alerted_profit_pct": 0.0
             }
-            return {
-                "success":  True,
-                "decision": "CONTINUE",
-                "message":  "Monitoring resumed. Alert thresholds reset."
-            }
-
+            return {"success": True, "decision": "CONTINUE",
+                    "message": "Monitoring resumed. Thresholds reset."}
         elif decision == "EXTEND":
-            # Open a new 30-day window from today
-            from datetime import date, timedelta
-            new_investment_date = date.today()
-            new_deadline        = new_investment_date + timedelta(days=30)
-            self.investment["investment_date"] = new_investment_date.isoformat()
-            self.investment["deadline_date"]   = new_deadline.isoformat()
+            new_dl = (date.today() + timedelta(days=30)).isoformat()
+            self.investment["investment_date"] = date.today().isoformat()
+            self.investment["deadline_date"] = new_dl
             self.alert_state = {
-                "loss_alert_armed":        True,
-                "upside_alert_armed":      True,
+                "loss_alert_armed": True,
+                "upside_alert_armed": True,
                 "last_alerted_profit_pct": 0.0
             }
-            return {
-                "success":     True,
-                "decision":    "EXTEND",
-                "message":     f"New 30-day window opened. "
-                               f"New deadline: {new_deadline.isoformat()}",
-                "new_deadline":new_deadline.isoformat()
-            }
+            return {"success": True, "decision": "EXTEND",
+                    "message": f"New 30-day window. Deadline: {new_dl}",
+                    "new_deadline": new_dl}
 
     def get_status(self) -> dict:
-        """
-        Returns the current system state — useful for debugging
-        and for the client to check their investment status.
-        """
+        """Returns current system state."""
         if self.phase == "PRE_INVESTMENT":
-            return {
-                "phase": "PRE_INVESTMENT",
-                "message": "No active investment. Call get_top5_stocks() "
-                           "then confirm_investment()."
-            }
-
-        days_remaining = get_days_remaining(
-            self.investment["investment_date"]
-        ) if self.investment else 0
-
+            return {"phase": "PRE_INVESTMENT",
+                    "message": "No investment yet."}
         return {
-            "phase":             self.phase,
-            "ticker":            self.investment.get("ticker"),
-            "investment_date":   self.investment.get("investment_date"),
-            "deadline_date":     self.investment.get("deadline_date"),
-            "days_remaining":    days_remaining,
-            "purchase_price":    self.investment.get("purchase_price"),
-            "shares":            self.investment.get("shares"),
-            "total_invested":    self.investment.get("total_invested"),
-            "last_profit_pct":   self.last_poll_profit_pct,
-            "status":            self.investment.get("status"),
-            "alert_state":       self.alert_state
+            "phase":           self.phase,
+            "ticker":          self.investment.get("ticker"),
+            "investment_date": self.investment.get("investment_date"),
+            "deadline_date":   self.investment.get("deadline_date"),
+            "days_remaining":  get_days_remaining(
+                self.investment["investment_date"]),
+            "purchase_price":  self.investment.get("purchase_price"),
+            "shares":          self.investment.get("shares"),
+            "total_invested":  self.investment.get("total_invested"),
+            "last_profit_pct": self.last_poll_profit_pct,
+            "status":          self.investment.get("status"),
+            "alert_state":     self.alert_state
         }
-
-    # ─────────────────────────────────────────────────────────────
-    #  PRIVATE HELPERS
-    # ─────────────────────────────────────────────────────────────
-
-    def _log(self, event_type: str, data: dict) -> None:
-        """Logs an event via the Decision Logger agent."""
-        investment_id = (
-            self.investment.get("investment_id", "PRE_INVESTMENT")
-            if self.investment else "PRE_INVESTMENT"
-        )
-        log_event(
-            investment_id = investment_id,
-            event_type    = event_type,
-            data          = data,
-            db_path       = self.db_path
-        )
-
-    def _send(self, notif_type: str, profit: dict,
-              recommendation: dict, days_remaining: int) -> dict:
-        """
-        Sends or previews a notification via the NOTIF agent.
-        In dry_run mode, prints the email instead of sending it.
-        """
-        if self.dry_run:
-            result = preview_notification(
-                notification_type = notif_type,
-                investment        = self.investment,
-                profit_data       = profit,
-                recommendation    = recommendation,
-                days_remaining    = days_remaining
-            )
-            if result["success"]:
-                print(f"\n  📧 [DRY RUN] {result['subject']}")
-                print(result["body"])
-            return result
-        else:
-            return send_notification(
-                notification_type = notif_type,
-                investment        = self.investment,
-                profit_data       = profit,
-                recommendation    = recommendation,
-                days_remaining    = days_remaining
-            )
